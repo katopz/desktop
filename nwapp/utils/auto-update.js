@@ -4,135 +4,125 @@ var log = require('loglevel');
 var notifier = require('./notifier');
 var pkg = require('../package.json');
 var gui = window.require('nw.gui');
-
-var CLIENT = require('./client-type');
-
+var os = require('./client-type');
 var Updater = require('node-webkit-updater');
+
 var updater = new Updater(pkg);
 
-// Promise wrapper for udpater.checkForNewVersion
-function checkForNewVersion() {
-  return new Promise(function (resolve, reject) {
-    log.info('Checking for updates');
-    updater.checkNewVersion(function (err, newVersionExists, newManifest) {
-      log.info('newVersionExists? ' + newVersionExists);
-      if (err || !newVersionExists) return reject();
-      resolve(newManifest);
+
+function downloadUpdate(manifest, cb) {
+  // node-webkit-updater:
+  // * doesnt clean up after itself
+  // * doesnt download to unique temp locations
+  // ...but its the best we have at the moment
+  updater.download(function(err, newAppPackage) {
+    if (err) return cb(err);
+
+    updater.unpack(newAppPackage, function(err, newAppExecutable) {
+      if (err) return cb(err);
+
+      cb(newAppExecutable);
+    // updater.unpack has an ugly api
+    }, manifest);
+
+  // updater.download has an ugly api
+  }, manifest);
+}
+
+function notifyLinuxUser(version) {
+  setInterval(function() {
+    notifier({
+      title: 'Gitter ' + version + ' Available',
+      message: 'Head over to gitter.im/apps to update.'
     });
-  });
+  }, 30 * 1000);
 }
 
-// Promise wrapper for updater.download
-function download(newManifest) {
-  return new Promise(function (resolve, reject) {
-    if (CLIENT === 'linux') {
-      notifier({
-        title: 'Update Available',
-        message: 'Head over to gitter.im/apps to get it.'
-      });
-      reject(new Error('Should not download auto update for ' + CLIENT));
-      return;
-    }
-    log.info('Downloading update');
-    updater.download(function (err, filename) {
-      return err ? reject(err) : resolve({filename: filename, newManifest: newManifest});
-    }, newManifest);
-  });
-}
+function notifyWinOsxUser(version, newAppExecutable) {
+  setInterval(function() {
+    notifier({
+      title: 'Gitter ' + version + ' Available',
+      message: 'Click to restart and apply update.',
+      click: function() {
+        log.info('Starting new app to install itself');
+        updater.runInstaller(newAppExecutable, [updater.getAppPath(), updater.getAppExec()], {});
 
-// Promise wrapper for updater.unpack
-function unpack(filename, newManifest) {
-  return new Promise(function (resolve, reject) {
-    log.info('Unpacking update');
-    updater.unpack(filename, function (err, newAppPath) {
-      return err ? reject(err) : resolve(newAppPath);
-    }, newManifest);
-  });
-}
-
-// Promise wrapper for updater.install
-function install(copyPath) {
-  return new Promise(function (resolve, reject) {
-    log.info('Installing at' + copyPath);
-    updater.install(copyPath, function (err) {
-      return err ? reject(err) : resolve();
-    });
-  });
-}
-
-// Check if CLI arguments where passed during startup
-function isInProgress() {
-  return gui.App.argv.length ? true : false;
-}
-
-// Poll S3 for updates and show a notification
-function pollForUpdates() {
-  // FIXME: we shouldn't do this in the same way for linux as it doesn't have auto-update. Notify of new update with link to update.gitter.im/linux/latest
-  checkForNewVersion()
-    .then(function (newManifest) {
-      return download(newManifest);
-    })
-    .then(function (downloadData) {
-      return unpack(downloadData.filename, downloadData.newManifest);
-    })
-    .then(function (newAppPath) {
-
-      function restart() {
-        log.info('Running Installer');
-        updater.runInstaller(newAppPath, [updater.getAppPath(), updater.getAppExec()], {});
         log.info('Quitting outdated app');
         gui.App.quit();
       }
-
-      // FIXME Find a way of making this notifications persistent
-      function restartNotification() {
-        notifier({
-          title: 'Update Ready',
-          message: 'Click here to reload the app now.',
-          click: function () { restart(); }
-        });
-      }
-
-      restartNotification();
-      setInterval(restartNotification, 30 * 1000);
-    })
-    .catch(function (err) {
-      log.error('[Update Error]: ' + err.stack);
     });
+  }, 30 * 1000);
 }
 
-// Will take CLI arguments and copy itself
-function finishUpdate() {
-  var copyPath = gui.App.argv[0];
-  var execPath = gui.App.argv[1];
 
-  // Replace old app, Run updated app from original location and close installer instance
-  return install(copyPath)
-  .then(function () {
+function listen() {
 
-    // The recommended updater.run(execPath, null) [1] doesn't work properly on Window.
+  function update() {
+    updater.checkNewVersion(function (err, newVersionExists, newManifest) {
+      if (err) {
+        log.error('request for app update manifest failed', err);
+        return tryAgainLater();
+      }
+
+      if (!newVersionExists) {
+        log.info('app currently at latest version');
+        return tryAgainLater();
+      }
+
+      // Update available!
+      var version = newManifest.version;
+
+      if (os === 'linux') {
+        // linux cannot autoupdate (yet)
+        return notifyLinuxUser(version);
+      }
+
+      downloadUpdate(newManifest, function(err, newAppLocation) {
+        if (err) {
+          log.error('app update ' + version + ' failed to download and unpack', err);
+          return tryAgainLater();
+        }
+
+        return notifyWinOsxUser(version, newAppLocation);
+      });
+    });
+  }
+
+  // polling with setInterval messes up on windows during sleep.
+  // the network requests bunch up, so its best to wait for the updater
+  // to finish each poll before triggering a new request.
+  function tryAgainLater() {
+    log.info('trying app update again in 30 mins');
+    setTimeout(update, 30 * 60 * 1000);
+  }
+
+  // update() retries on failure, so only call once.
+  update();
+}
+
+function overwriteOldApp(oldAppLocation, executable) {
+  updater.install(oldAppLocation, function(err) {
+    if (err) {
+      log.error('update failed, shutting down installer', err.stack);
+      return gui.App.quit();
+    }
+
+    // The recommended updater.run(execPath, null) [1] doesn't work properly on Windows.
     // It spawns a new child process but it doesn't detach so when the installer app quits the new version also quits. :poop:
     // [1] https://github.com/edjafarov/node-webkit-updater/blob/master/examples/basic.js#L29
     // https://github.com/edjafarov/node-webkit-updater/blob/master/app/updater.js#L404-L416
+    log.info('starting new version');
+    updater.run(executable, [], {});
 
-    log.info('Running new version: ' + execPath);
-    updater.run(execPath, [], {});
-    //gui.Shell.openItem(execPath);
-
-    function quitInstaller() {
-      log.info('Quitting the Installer app');
+    // wait for new version to get going...
+    setTimeout(function() {
+      log.info('shutting down installer');
       gui.App.quit();
-    }
-
-    setTimeout(quitInstaller, 5*1000);
-  })
-  .catch(function (err) {
-    log.error('Something went wrong with the update: ' + err.stack);
+    }, 5000);
   });
 }
 
 module.exports = {
-  isInProgress:   isInProgress,
-  finishUpdate:   finishUpdate,
-  pollForUpdates: pollForUpdates
+  listen: listen,
+  overwriteOldApp: overwriteOldApp
 };
