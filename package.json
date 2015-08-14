@@ -10,7 +10,12 @@
     "gulp-util": "^3.0.1",
     "lodash.template": "^3.0.1",
     "node-webkit-builder": "^1.0.5",
-    "semver": "^4.2.0"
+    "semver": "^4.2.0",
+    "loglevel": "",
+    "gitter-realtime-client": "",
+    "jfs": "",
+    "node-webkit-updater": "",
+    "oauth": ""
   },
   "scripts": {
     "postinstall": "(cd nwapp && npm install)",
